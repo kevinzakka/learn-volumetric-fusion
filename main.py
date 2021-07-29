@@ -5,9 +5,9 @@ from typing import Union
 
 import matplotlib.pyplot as plt
 import numpy as np
-import tqdm
 from absl import app, flags
 from PIL import Image
+from tqdm import tqdm
 
 import fusion
 
@@ -61,15 +61,26 @@ def load_pose(filename: Union[str, Path]) -> np.ndarray:
     return np.loadtxt(filename).astype(np.float32)
 
 
-def get_convex_hull(intr: fusion.Intrinsic, max_frames: int = -1) -> np.ndarray:
-    """Compute the bounds of the convex hull of camera view frustums."""
-    print(max_frames)
-    volume_bounds = np.zeros((3, 2))
-    # Load depth image.
-    # Load camera pose.
-    # Compute camera view frustum.
-    # Extend convex hull.
-    pass
+def get_convex_hull(
+    path: Path, intr: fusion.Intrinsic, max_frames: int = -1
+) -> np.ndarray:
+    """Compute extrema of convex hull of camera view frustums."""
+    depth_filenames = list(path.glob("*depth.png"))
+    pose_filenames = list(path.glob("*pose.txt"))
+    if max_frames != -1:
+        np.random.shuffle(depth_filenames)
+        np.random.shuffle(pose_filenames)
+        depth_filenames = depth_filenames[:max_frames]
+        pose_filenames = pose_filenames[:max_frames]
+    n_files = len(pose_filenames)
+    vol_bounds = np.zeros((3, 2))
+    for depth_f, pose_f in tqdm(zip(depth_filenames, pose_filenames), total=n_files):
+        depth_im = load_depth(depth_f)
+        cam_pose = load_pose(pose_f)
+        view_frustum = fusion.get_view_frustum(depth_im, intr, cam_pose)
+        vol_bounds[:, 0] = np.minimum(vol_bounds[:, 0], np.amin(view_frustum, axis=1))
+        vol_bounds[:, 1] = np.maximum(vol_bounds[:, 1], np.amax(view_frustum, axis=1))
+    return vol_bounds
 
 
 def main(_):
@@ -82,22 +93,14 @@ def main(_):
     # Load camera intrinsic parameters.
     intr = load_intrinsics(path / "camera-intrinsics.txt")
 
-    # Compute volume bounds on 10% of the dataset.
-    volume_bounds = get_convex_hull(intr, int(FLAGS.volume_bounds_frac * n_total))
+    # Compute volume bounds in world coordindates of the convex hull of camera view
+    # frustums in the dataset.
+    volume_bounds = get_convex_hull(
+        path,
+        intr,
+        int(FLAGS.volume_bounds_frac * n_total),
+    )
 
-    # pose = load_pose(path / POSE_PATH.format(500))
-    # color_im = load_color(path / COLOR_PATH.format(500))
-    # depth_im = load_depth(path / DEPTH_PATH.format(500))
-    # frame = fusion.Frame(
-    #     color=color_im,
-    #     depth=depth_im,
-    #     intrinsic=intr,
-    #     extrinsic=pose,
-    # )
-    # fig, axes = plt.subplots(1, 2)
-    # for ax, im in zip(axes, [color_im, depth_im]):
-    #     ax.imshow(im)
-    # plt.show()
 
 
 if __name__ == "__main__":

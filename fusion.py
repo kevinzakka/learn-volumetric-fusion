@@ -42,6 +42,23 @@ class Frame:
     """Camera pose, of shape (4, 4)."""
 
 
+def get_view_frustum(
+    depth_im: np.ndarray,
+    intr: Intrinsic,
+    extr: np.ndarray,
+) -> np.ndarray:
+    """Get the corners of the camera frustum from the depth image."""
+    pass
+
+
+def rigid_transform(xyz, transform):
+    """Applies an SE(3) transform on a pointcloud."""
+    # Homogenize coordinates.
+    # Matrix multiplication.
+    pass
+
+
+
 class TSDFVolume:
     """Volumetric TSDF Fusion of RGB-D Images."""
 
