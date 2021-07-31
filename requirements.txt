@@ -1,2 +1,3 @@
 tqdm
 absl-py
+opencv-python
