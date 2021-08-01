@@ -1,7 +1,6 @@
-import math
-import time
 from dataclasses import dataclass
-from typing import Tuple
+from pathlib import Path
+from typing import Tuple, Union
 
 import numpy as np
 
@@ -55,6 +54,16 @@ class Intrinsic:
             ],
             dtype=np.float32,
         )
+
+    @classmethod
+    def from_file(
+        cls,
+        filename: Union[str, Path],
+        width: int,
+        height: int,
+    ) -> "Intrinsic":
+        mat = np.loadtxt(filename, delimiter=" ", dtype=np.float32)
+        return cls(width, height, mat[0, 0], mat[1, 1], mat[0, 2], mat[1, 2])
 
 
 class UniformTSDFVolume:
@@ -150,7 +159,7 @@ class TSDFFusion:
 
 
 def se3_inverse(pose: np.ndarray) -> np.ndarray:
-    """A faster SE3 inverse."""
+    """Compute the inverse of an SE(3) transform."""
     inv_pose = np.empty_like(pose)
     tr = pose[:3, :3].T
     inv_pose[:3, :3] = tr
@@ -170,19 +179,12 @@ def surface_reconstruction(
     """Integration of surface measurements into a global volume."""
 
     # Compute xyz coordinates using voxel_scale.
-
     # Convert to camera coordinates.
-
     # If z is <= 0 remove.
-
     # Convert to pixel coordinates using intrinsic.
-
     # Eliminate pixels outside view frustum.
-
     # Get depth[u, v]. If <=0, remove.
-
     # Reproject and unit normalize.
-
     # Compute sdf.
 
 
