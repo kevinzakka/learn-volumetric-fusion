@@ -20,25 +20,26 @@ def main(_):
     intr = fusion.Intrinsic.from_file(intr_filename, width=640, height=480)
 
     # Instantiate global config.
-    config = fusion.GlobalConfig()
-    config.volume_size = (512, 512, 512)
-    config.voxel_scale = 0.02
-    config.truncation_distance = 5 * config.voxel_scale
-    config.depth_cutoff_distance = 4.0
+    config = fusion.GlobalConfig(
+        volume_size=(512, 512, 512),
+        voxel_scale=0.02,
+        truncation_distance=5 * 0.02,
+        depth_cutoff_distance=4.0,
+    )
     print(config)
 
     # Instantiate fusion pipeline with camera parameters and global config.
     pipeline = fusion.TSDFFusion(intr, config)
 
     # Loop through the RGB-D frames and integrate.
-    n_frames = 100
+    n_frames = 1_000
     for i in tqdm(range(0, n_frames, 5)):
         pipeline.integrate(
             utils.load_color(path / f"frame-{i:06}.color.jpg"),
             utils.load_depth(path / f"frame-{i:06}.depth.png"),
             utils.load_pose(path / f"frame-{i:06}.pose.txt"),
         )
-        if not i % 10:
+        if not i % 25:
             mesh_args = pipeline.extract_mesh()
             utils.meshwrite("./mesh.ply", *mesh_args)
 

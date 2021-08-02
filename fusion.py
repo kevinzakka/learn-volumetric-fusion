@@ -18,7 +18,7 @@ Int3 = Tuple[int, int, int]
 Mesh = Tuple[np.ndarray, ...]
 
 
-@dataclass
+@dataclass(frozen=True)
 class GlobalConfig:
     """The global configuration."""
 
@@ -93,7 +93,6 @@ class UniformTSDFVolume:
         # TODO(kevin): Understand why TSDF vol is initialized with 1 and not 0.
         self._tsdf_volume = np.ones(self.volume_size, dtype=np.int16)
         self._weight_volume = np.zeros(self.volume_size, dtype=np.int16)
-
         self._color_volume = np.zeros(self.volume_size + (3,), dtype=np.uint8)
 
         size = 0
