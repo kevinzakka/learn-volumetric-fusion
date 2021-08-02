@@ -10,7 +10,8 @@ def load_depth(filename):
     img = cv2.imread(str(filename), cv2.IMREAD_ANYDEPTH).astype(np.float32)
     # Set invalid depth values to 0. This is specific to the 7-scenes dataset, see:
     # https://www.microsoft.com/en-us/research/project/rgb-d-dataset-7-scenes/
-    img[img == 65535] = 0
+    img /= 1000.0
+    img[img == 65.535] = 0.0
     return img
 
 

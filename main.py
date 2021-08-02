@@ -1,7 +1,5 @@
-from os import pipe
 from pathlib import Path
 
-import numpy as np
 from absl import app, flags
 from tqdm import tqdm
 
@@ -11,11 +9,6 @@ import utils
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("path", "data", "Path to dataset.")
-
-# Path templates.
-DEPTH_PATH = "frame-{:06}.depth.png"
-COLOR_PATH = "frame-{:06}.color.jpg"
-POSE_PATH = "frame-{:06}.pose.txt"
 
 
 def main(_):
@@ -28,23 +21,26 @@ def main(_):
 
     # Instantiate global config.
     config = fusion.GlobalConfig()
-    config.volume_size = (471, 289, 292)  # (512, 512, 512)
-    config.voxel_scale = 0.02 * 1000.0
+    config.volume_size = (512, 512, 512)
+    config.voxel_scale = 0.02
     config.truncation_distance = 5 * config.voxel_scale
-    config.depth_cutoff_distance = 4.0 * 1000.0
+    config.depth_cutoff_distance = 4.0
     print(config)
 
     # Instantiate fusion pipeline with camera parameters and global config.
     pipeline = fusion.TSDFFusion(intr, config)
 
-    # Loop through the RGB-D frames and fuse.
-    n_frames = 1
-    for i in tqdm(range(n_frames)):
+    # Loop through the RGB-D frames and integrate.
+    n_frames = 100
+    for i in tqdm(range(0, n_frames, 5)):
         pipeline.integrate(
-            utils.load_color(path / COLOR_PATH.format(i)),
-            utils.load_depth(path / DEPTH_PATH.format(i)),
-            utils.load_pose(path / POSE_PATH.format(i)),
+            utils.load_color(path / f"frame-{i:06}.color.jpg"),
+            utils.load_depth(path / f"frame-{i:06}.depth.png"),
+            utils.load_pose(path / f"frame-{i:06}.pose.txt"),
         )
+        if not i % 10:
+            mesh_args = pipeline.extract_mesh()
+            utils.meshwrite("./mesh.ply", *mesh_args)
 
     mesh_args = pipeline.extract_mesh()
     utils.meshwrite("./mesh.ply", *mesh_args)
