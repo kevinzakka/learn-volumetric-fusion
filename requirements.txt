@@ -3,3 +3,5 @@ absl-py
 opencv-python
 scikit-image
 numpy
+jax_dataclasses
+gdown
