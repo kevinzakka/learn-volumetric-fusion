@@ -32,7 +32,7 @@ def main(_):
     pipeline = fusion.TSDFFusion(intr, config)
 
     # Loop through the RGB-D frames and integrate.
-    n_frames = 1_000
+    n_frames = 5
     for i in tqdm(range(0, n_frames, 5)):
         pipeline.integrate(
             utils.load_color(path / f"frame-{i:06}.color.jpg"),
