@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import abc
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Tuple, Union
@@ -57,41 +58,44 @@ class Intrinsic:
             dtype=np.float32,
         )
 
-    @classmethod
-    def from_file(
-        cls, filename: Union[str, Path], width: int, height: int
-    ) -> Intrinsic:
+    @staticmethod
+    def from_file(filename: Union[str, Path], width: int, height: int) -> Intrinsic:
         mat = np.loadtxt(filename, delimiter=" ", dtype=np.float32)
-        return cls(width, height, mat[0, 0], mat[1, 1], mat[0, 2], mat[1, 2])
+        return Intrinsic(width, height, mat[0, 0], mat[1, 1], mat[0, 2], mat[1, 2])
 
 
 @dataclass(frozen=True)
-class UniformTSDFVolume:
+class TSDFVolume:
     """A TSDF volume with a uniform voxel grid [1].
 
     References:
         [1]: Curless and Levoy, 1996.
     """
 
-    volume_size: Int3
-    """The dimensions of the 3D volume."""
+    camera_params: Intrinsic
+    """The camera parameters."""
 
-    voxel_scale: float
-    """Controls the resolution of the volume."""
+    config: GlobalConfig
+    """The config values."""
 
     tsdf_volume: np.ndarray
+    """The global volume in which depth frames are fused."""
+
     weight_volume: np.ndarray
+    """Holds the weights of the moving average."""
+
     color_volume: np.ndarray
+    """The global color volume in which color frames are fused."""
 
     @staticmethod
-    def initialize(config: GlobalConfig) -> UniformTSDFVolume:
+    def initialize(camera_params: Intrinsic, config: GlobalConfig) -> TSDFVolume:
         tsdf_volume = np.ones(config.volume_size, dtype=np.int16)
         weight_volume = np.zeros(config.volume_size, dtype=np.int16)
         color_volume = np.zeros(config.volume_size + (3,), dtype=np.uint8)
 
-        return UniformTSDFVolume(
-            config.volume_size,
-            config.voxel_scale,
+        return TSDFVolume(
+            camera_params,
+            config,
             tsdf_volume,
             weight_volume,
             color_volume,
@@ -99,21 +103,63 @@ class UniformTSDFVolume:
 
     @property
     def center_point(self) -> np.ndarray:
-        return -0.5 * self.voxel_scale * np.asarray(self.volume_size, dtype=np.float32)
+        arr = np.array(self.config.volume_size, dtype=np.float32)
+        return -0.5 * self.config.voxel_scale * arr
 
-    def integrate(self, color_im, depth_im, pose, intr, truncation_distance) -> UniformTSDFVolume:
-        """Integration of surface measurements into a global volume."""
+    def integrate(
+        self,
+        color_im: np.ndarray,
+        depth_im: np.ndarray,
+        pose: np.ndarray,
+    ) -> TSDFVolume:
+        """Integrate an RGB-D frame into the TSDF volume."""
 
+        # Sanity check shapes.
+        assert pose.shape == (4, 4)
+        assert color_im.shape[:2] == depth_im.shape[:2]
+        if (
+            depth_im.shape[0] != self.camera_params.height
+            or depth_im.shape[1] != self.camera_params.width
+        ):
+            raise ValueError(f"Depth image size does not match camera parameters.")
+
+        # Truncate depth values >= than the cutoff.
+        depth_im[depth_im >= self.config.depth_cutoff_distance] = 0.0
+
+        return self._integrate(
+            color_im,
+            depth_im,
+            se3_inverse(pose),
+            self.camera_params,
+            self.config.truncation_distance,
+        )
+
+    def extract_mesh(self) -> Mesh:
+        return extract_mesh(
+            self.tsdf_volume,
+            self.color_volume,
+            self.config.voxel_scale,
+            self.center_point,
+        )
+
+    def _integrate(
+        self,
+        color_im: np.ndarray,
+        depth_im: np.ndarray,
+        pose: np.ndarray,
+        intr: Intrinsic,
+        truncation_distance: float,
+    ) -> TSDFVolume:
         tsdf_volume_new = np.copy(self.tsdf_volume)
         weight_volume_new = np.copy(self.weight_volume)
         color_volume_new = np.copy(self.color_volume)
 
         # Create voxel grid coordinates.
-        vox_coords = np.indices(self.volume_size).reshape(3, -1).T
+        vox_coords = np.indices(self.config.volume_size).reshape(3, -1).T
 
         # Convert voxel center from grid coordinates to base frame camera coordinates.
         world_pts = (
-            (vox_coords.astype(np.float32) + 0.5) * self.voxel_scale
+            (vox_coords.astype(np.float32) + 0.5) * self.config.voxel_scale
         ) + self.center_point
 
         # Convert from base frame camera coordinates to current frame camera coordinates.
@@ -176,90 +222,36 @@ class UniformTSDFVolume:
         )
 
 
-class TSDFFusion:
-    """Volumetric TSDF Fusion of RGB-D Images."""
+# ======================================================= #
+# Helper methods.
+# ======================================================= #
 
-    def __init__(self, camera_params: Intrinsic, config: GlobalConfig):
-        """Set up the internal volume and camera parameters."""
-
-        self._camera_params = camera_params
-        self._config = config
-
-        self._volume = None
-        self._frame_id = None
-        self.reset()
-
-    def reset(self):
-        self._volume = UniformTSDFVolume.initialize(self._config)
-        self._frame_id = 0
-
-    def integrate(
-        self,
-        color_im,
-        depth_im,
-        pose,
-    ):
-        """Integrate an RGB-D frame into the TSDF volume."""
-
-        # Sanity check shapes.
-        assert pose.shape == (4, 4)
-        assert color_im.shape[:2] == depth_im.shape[:2]
-        if (
-            depth_im.shape[0] != self._camera_params.height
-            or depth_im.shape[1] != self._camera_params.width
-        ):
-            raise ValueError(f"Depth image size does not match camera parameters.")
-
-        # Truncate depth values >= than the cutoff.
-        depth_im[depth_im >= self._config.depth_cutoff_distance] = 0.0
-
-        # Fuse the RGB-D frame into the volume.
-        self._volume = self._volume.integrate(
-            color_im,
-            depth_im,
-            se3_inverse(pose),
-            self._camera_params,
-            self._config.truncation_distance,
-        )
-
-        self._frame_id += 1
-
-    def extract_pointcloud(self):
-        return extract_points(self._volume)
-
-    def extract_mesh(self) -> Mesh:
-        return extract_mesh(self._volume)
-
-    @property
-    def frame_id(self) -> int:
-        return self._frame_id
-
-
-def se3_inverse(pose: np.ndarray) -> np.ndarray:
+def se3_inverse(se3: np.ndarray) -> np.ndarray:
     """Compute the inverse of an SE(3) transform."""
-    inv_pose = np.empty_like(pose)
-    tr = pose[:3, :3].T
-    inv_pose[:3, :3] = tr
-    inv_pose[:3, 3] = -tr @ pose[:3, 3]
-    inv_pose[3, :] = [0, 0, 0, 1.0]
-    return inv_pose
+    inv_se3 = np.empty_like(se3)
+    tr = se3[:3, :3].T
+    inv_se3[:3, :3] = tr
+    inv_se3[:3, 3] = -tr @ se3[:3, 3]
+    inv_se3[3, :] = [0, 0, 0, 1.0]
+    return inv_se3
 
 
-def se3_transform(xyz, transform):
-    return (transform[:3, :3] @ xyz.T).T + transform[:3, 3]
+def se3_transform(pts: np.ndarray, se3: np.ndarray) -> np.ndarray:
+    """Apply an SE(3) transform to a pointcloud."""
+    return (se3[:3, :3] @ pts.T).T + se3[:3, 3]
 
 
-def extract_points(volume: UniformTSDFVolume):
-    """Extract a pointcloud from a TSDF volume."""
-    raise NotImplementedError
-
-
-def extract_mesh(volume: UniformTSDFVolume) -> Mesh:
-    """Extract a surface mesh from a TSDF volume using the Marching Cubes algorithm."""
-    tsdf_volume = volume.tsdf_volume.astype(np.float32) * DIVSHORTMAX
+def extract_mesh(
+    tsdf_volume: np.ndarray,
+    color_volume: np.ndarray,
+    voxel_scale: float,
+    origin: np.ndarray,
+) -> Mesh:
+    """Extract a surface mesh from a TSDF volume using Marching Cubes."""
+    tsdf_volume = tsdf_volume.astype(np.float32) * DIVSHORTMAX
     mask = (tsdf_volume > -0.5) & (tsdf_volume < 0.5)
     verts, faces, norms, _ = marching_cubes(tsdf_volume, mask=mask, level=0)
-    verts_ind = np.round(verts).astype(int)
-    verts = verts * volume.voxel_scale + volume.center_point
-    colors = volume.color_volume[verts_ind[:, 0], verts_ind[:, 1], verts_ind[:, 2]]
+    vix, viy, viz = np.round(verts).astype(np.int16).T
+    verts = verts * voxel_scale + origin
+    colors = color_volume[vix, viy, viz]
     return verts, faces, norms, colors

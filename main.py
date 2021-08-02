@@ -28,22 +28,22 @@ def main(_):
     )
     print(config)
 
-    # Instantiate fusion pipeline with camera parameters and global config.
-    pipeline = fusion.TSDFFusion(intr, config)
+    # Initialize TSDF volume with camera parameters and global config.
+    volume = fusion.TSDFVolume.initialize(intr, config)
 
     # Loop through the RGB-D frames and integrate.
-    n_frames = 5
+    n_frames = 100
     for i in tqdm(range(0, n_frames, 5)):
-        pipeline.integrate(
+        volume = volume.integrate(
             utils.load_color(path / f"frame-{i:06}.color.jpg"),
             utils.load_depth(path / f"frame-{i:06}.depth.png"),
             utils.load_pose(path / f"frame-{i:06}.pose.txt"),
         )
         if not i % 25:
-            mesh_args = pipeline.extract_mesh()
+            mesh_args = volume.extract_mesh()
             utils.meshwrite("./mesh.ply", *mesh_args)
 
-    mesh_args = pipeline.extract_mesh()
+    mesh_args = volume.extract_mesh()
     utils.meshwrite("./mesh.ply", *mesh_args)
 
 
