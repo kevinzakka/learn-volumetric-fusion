@@ -49,16 +49,16 @@ class Intrinsic:
     cx: float = jax_dataclasses.static_field()
     cy: float = jax_dataclasses.static_field()
 
-    @property
-    def matrix(self) -> np.ndarray:
-        return np.array(
-            [
-                [self.fx, 0.0, self.cx],
-                [0.0, self.fy, self.cy],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
+    # @property
+    # def matrix(self) -> np.ndarray:
+    #     return np.array(
+    #         [
+    #             [self.fx, 0.0, self.cx],
+    #             [0.0, self.fy, self.cy],
+    #             [0.0, 0.0, 1.0],
+    #         ],
+    #         dtype=np.float32,
+    #     )
 
     @staticmethod
     def from_file(filename: Union[str, Path], width: int, height: int) -> Intrinsic:
@@ -153,7 +153,7 @@ class TSDFVolume:
             cp,
         )
 
-    @partial(jit, static_argnums=[0, 1, 2, 3, 4, 5])
+    # @partial(jit, static_argnums=[4, 5])
     def _integrate(
         self,
         color_im: np.ndarray,
@@ -180,55 +180,62 @@ class TSDFVolume:
         # Remove points with negative z.
         mask = cam_pts[:, 2] > 0
 
-        # Convert to camera pixels.
-        pix_x = np.full_like(cam_pts[:, 0], -1, dtype=np.int32)
-        pix_y = np.full_like(cam_pts[:, 0], -1, dtype=np.int32)
-        pix_x = pix_x.at[mask].set(
-            np.around(
-                cam_pts[mask, 0] / cam_pts[mask, 2] * intr.fx + intr.cx
-            ).astype(np.int32)
-        )
-        pix_y = pix_y.at[mask].set(
-            np.around(
-                cam_pts[mask, 1] / cam_pts[mask, 2] * intr.fy + intr.cy
-            ).astype(np.int32)
-        )
+        from ipdb import set_trace
+        set_trace()
 
-        # Eliminate pixels outside view frustum.
-        mask &= (pix_x >= 0) & (pix_x < intr.width) & (pix_y >= 0) & (pix_y < intr.height)
-        depth_val = np.zeros_like(pix_x, dtype=np.float32)
-        depth_val = depth_val.at[mask].set(depth_im[pix_y[mask], pix_x[mask]])
+        mask = cam_pts[:, 2] > 0
+        pix_x = np.around(cam_pts[:, 0] / cam_pts[:, 2] * intr.fx + intr.cx).astype(np.int32)
 
-        sdf = depth_val - cam_pts[:, 2]
-        valid_pts = (depth_val > 0) & (sdf >= -truncation_distance)
-        tsdf = np.minimum(1.0, sdf / truncation_distance)
-        valid_vox_x = vox_coords[valid_pts, 0]
-        valid_vox_y = vox_coords[valid_pts, 1]
-        valid_vox_z = vox_coords[valid_pts, 2]
-        tsdf_new = tsdf[valid_pts]
-        tsdf_vals = self.tsdf_volume[valid_vox_x, valid_vox_y, valid_vox_z]
-        tsdf_vals = tsdf_vals.astype(np.float32) * DIVSHORTMAX
-        w_old = self.weight_volume[valid_vox_x, valid_vox_y, valid_vox_z]
-        obs_weight = 1
-        tsdf_vol_new = (w_old * tsdf_vals + obs_weight * tsdf_new) / (w_old + obs_weight)
-        tsdf_vol_new = np.clip(
-            (tsdf_vol_new * SHORTMAX).astype(np.int16),
-            a_min=-SHORTMAX,
-            a_max=SHORTMAX,
-        )
+        pix_y = np.around(cam_pts[:, 1] / cam_pts[:, 2] * intr.fy + intr.cy).astype(np.int32)
 
-        tsdf_volume_new = tsdf_volume_new.at[valid_vox_x, valid_vox_y, valid_vox_z].set(tsdf_vol_new)
-        w_new = np.minimum(w_old + obs_weight, MAX_WEIGHT)
-        weight_volume_new = weight_volume_new.at[valid_vox_x, valid_vox_y, valid_vox_z].set(w_new)
+        # pix_x = np.full_like(cam_pts[:, 0], -1, dtype=np.int32)
+        # pix_y = np.full_like(cam_pts[:, 0], -1, dtype=np.int32)
+        # pix_x = pix_x.at[mask].set(
+        #     np.around(
+        #         cam_pts[mask, 0] / cam_pts[mask, 2] * intr.fx + intr.cx
+        #     ).astype(np.int32)
+        # )
+        # pix_y = pix_y.at[mask].set(
+        #     np.around(
+        #         cam_pts[mask, 1] / cam_pts[mask, 2] * intr.fy + intr.cy
+        #     ).astype(np.int32)
+        # )
 
-        for i in range(3):
-            color_volume_new = color_volume_new.at[valid_vox_x, valid_vox_y, valid_vox_z, i].set(
-                (
-                    w_old * self.color_volume[valid_vox_x, valid_vox_y, valid_vox_z, i]
-                    + obs_weight * color_im[pix_y[valid_pts], pix_x[valid_pts], i]
-                )
-                / (w_old + obs_weight)
-            ).astype(np.uint8)
+        # # Eliminate pixels outside view frustum.
+        # mask &= (pix_x >= 0) & (pix_x < intr.width) & (pix_y >= 0) & (pix_y < intr.height)
+        # depth_val = np.zeros_like(pix_x, dtype=np.float32)
+        # depth_val = depth_val.at[mask].set(depth_im[pix_y[mask], pix_x[mask]])
+
+        # sdf = depth_val - cam_pts[:, 2]
+        # valid_pts = (depth_val > 0) & (sdf >= -truncation_distance)
+        # tsdf = np.minimum(1.0, sdf / truncation_distance)
+        # valid_vox_x = vox_coords[valid_pts, 0]
+        # valid_vox_y = vox_coords[valid_pts, 1]
+        # valid_vox_z = vox_coords[valid_pts, 2]
+        # tsdf_new = tsdf[valid_pts]
+        # tsdf_vals = self.tsdf_volume[valid_vox_x, valid_vox_y, valid_vox_z]
+        # tsdf_vals = tsdf_vals.astype(np.float32) * DIVSHORTMAX
+        # w_old = self.weight_volume[valid_vox_x, valid_vox_y, valid_vox_z]
+        # obs_weight = 1
+        # tsdf_vol_new = (w_old * tsdf_vals + obs_weight * tsdf_new) / (w_old + obs_weight)
+        # tsdf_vol_new = np.clip(
+        #     (tsdf_vol_new * SHORTMAX).astype(np.int16),
+        #     a_min=-SHORTMAX,
+        #     a_max=SHORTMAX,
+        # )
+
+        # tsdf_volume_new = tsdf_volume_new.at[valid_vox_x, valid_vox_y, valid_vox_z].set(tsdf_vol_new)
+        # w_new = np.minimum(w_old + obs_weight, MAX_WEIGHT)
+        # weight_volume_new = weight_volume_new.at[valid_vox_x, valid_vox_y, valid_vox_z].set(w_new)
+
+        # for i in range(3):
+        #     color_volume_new = color_volume_new.at[valid_vox_x, valid_vox_y, valid_vox_z, i].set(
+        #         (
+        #             w_old * self.color_volume[valid_vox_x, valid_vox_y, valid_vox_z, i]
+        #             + obs_weight * color_im[pix_y[valid_pts], pix_x[valid_pts], i]
+        #         )
+        #         / (w_old + obs_weight)
+        #     ).astype(np.uint8)
 
         with jax_dataclasses.copy_and_mutate(self) as new_state:
             new_state.tsdf_volume = tsdf_volume_new
