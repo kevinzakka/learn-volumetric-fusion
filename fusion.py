@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import abc
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple, Union
 
@@ -11,7 +10,7 @@ from skimage.measure import marching_cubes
 # Global constants.
 BYTES_TO_GIGABYTES = 1.0 / (1 << 30)
 SHORTMAX = np.iinfo(np.int16).max
-DIVSHORTMAX = 0.0000305185
+DIVSHORTMAX = 1.0 / SHORTMAX
 MAX_WEIGHT = 128
 
 # Global types.
@@ -87,11 +86,33 @@ class TSDFVolume:
     color_volume: np.ndarray
     """The global color volume in which color frames are fused."""
 
+    voxel_coords: np.ndarray
+    """Voxel grid coordinates."""
+
+    world_pts: np.ndarray
+    """Voxel coordinates in base camera frame."""
+
+    center_pt: np.ndarray
+    """Voxel center."""
+
     @staticmethod
     def initialize(camera_params: Intrinsic, config: GlobalConfig) -> TSDFVolume:
+        # Allocate volumes.
         tsdf_volume = np.ones(config.volume_size, dtype=np.int16)
         weight_volume = np.zeros(config.volume_size, dtype=np.int16)
         color_volume = np.zeros(config.volume_size + (3,), dtype=np.uint8)
+
+        # Create voxel grid coordinates.
+        voxel_coords = np.indices(config.volume_size).reshape(3, -1).T
+
+        # Compute center point.
+        center_pt = (
+            -0.5 * config.voxel_scale * np.array(config.volume_size, dtype=np.float32)
+        )
+
+        # Convert voxel grid coordiantes to base frame camera coordinates.
+        world_pts = (voxel_coords.astype(np.float32) + 0.5) * config.voxel_scale
+        world_pts += center_pt
 
         return TSDFVolume(
             camera_params,
@@ -99,19 +120,17 @@ class TSDFVolume:
             tsdf_volume,
             weight_volume,
             color_volume,
+            voxel_coords,
+            world_pts,
+            center_pt,
         )
-
-    @property
-    def center_point(self) -> np.ndarray:
-        arr = np.array(self.config.volume_size, dtype=np.float32)
-        return -0.5 * self.config.voxel_scale * arr
 
     def integrate(
         self,
         color_im: np.ndarray,
         depth_im: np.ndarray,
         pose: np.ndarray,
-    ) -> TSDFVolume:
+    ):
         """Integrate an RGB-D frame into the TSDF volume."""
 
         # Sanity check shapes.
@@ -121,17 +140,19 @@ class TSDFVolume:
             depth_im.shape[0] != self.camera_params.height
             or depth_im.shape[1] != self.camera_params.width
         ):
-            raise ValueError(f"Depth image size does not match camera parameters.")
+            raise ValueError("Depth image size does not match camera parameters.")
 
         # Truncate depth values >= than the cutoff.
         depth_im[depth_im >= self.config.depth_cutoff_distance] = 0.0
 
-        return self._integrate(
+        self._integrate(
             color_im,
             depth_im,
             se3_inverse(pose),
             self.camera_params,
             self.config.truncation_distance,
+            self.voxel_coords,
+            self.world_pts,
         )
 
     def extract_mesh(self) -> Mesh:
@@ -139,7 +160,7 @@ class TSDFVolume:
             self.tsdf_volume,
             self.color_volume,
             self.config.voxel_scale,
-            self.center_point,
+            self.center_pt,
         )
 
     def _integrate(
@@ -149,82 +170,69 @@ class TSDFVolume:
         pose: np.ndarray,
         intr: Intrinsic,
         truncation_distance: float,
-    ) -> TSDFVolume:
-        tsdf_volume_new = np.copy(self.tsdf_volume)
-        weight_volume_new = np.copy(self.weight_volume)
-        color_volume_new = np.copy(self.color_volume)
-
-        # Create voxel grid coordinates.
-        vox_coords = np.indices(self.config.volume_size).reshape(3, -1).T
-
-        # Convert voxel center from grid coordinates to base frame camera coordinates.
-        world_pts = (
-            (vox_coords.astype(np.float32) + 0.5) * self.config.voxel_scale
-        ) + self.center_point
-
+        voxel_coords: np.ndarray,
+        world_pts: np.ndarray,
+    ):
         # Convert from base frame camera coordinates to current frame camera coordinates.
-        cam_pts = se3_transform(world_pts, pose)
-
-        # Remove points with negative z.
-        mask = cam_pts[:, 2] > 0
+        cam_pts = apply_se3(world_pts, pose)
 
         # Convert to camera pixels.
-        pix_x = np.full_like(cam_pts[:, 0], -1, dtype=np.int32)
-        pix_y = np.full_like(cam_pts[:, 0], -1, dtype=np.int32)
-        pix_x[mask] = np.around(
-            cam_pts[mask, 0] / cam_pts[mask, 2] * intr.fx + intr.cx
-        ).astype(np.int32)
-        pix_y[mask] = np.around(
-            cam_pts[mask, 1] / cam_pts[mask, 2] * intr.fy + intr.cy
-        ).astype(np.int32)
+        with np.errstate(divide="ignore"):
+            pix_x = cam_pts[:, 0] / cam_pts[:, 2]
+            pix_x *= intr.fx
+            pix_x += intr.cx
+            pix_x = np.round(pix_x).astype(np.int32)
+            pix_y = cam_pts[:, 1] / cam_pts[:, 2]
+            pix_y *= intr.fy
+            pix_y += intr.cy
+            pix_y = np.round(pix_y).astype(np.int32)
+        pix_x = np.nan_to_num(pix_x, copy=False, nan=0)
+        pix_y = np.nan_to_num(pix_y, copy=False, nan=0)
 
         # Eliminate pixels outside view frustum.
-        mask &= (pix_x >= 0) & (pix_x < intr.width) & (pix_y >= 0) & (pix_y < intr.height)
+        mask = cam_pts[:, 2] > 0
+        mask &= pix_x >= 0
+        mask &= pix_x < intr.width
+        mask &= pix_y >= 0
+        mask &= pix_y < intr.height
         depth_val = np.zeros_like(pix_x, dtype=np.float32)
         depth_val[mask] = depth_im[pix_y[mask], pix_x[mask]]
 
-        sdf = depth_val - cam_pts[:, 2]
-        valid_pts = (depth_val > 0) & (sdf >= -truncation_distance)
-        tsdf = np.minimum(1.0, sdf / truncation_distance)
-        valid_vox_x = vox_coords[valid_pts, 0]
-        valid_vox_y = vox_coords[valid_pts, 1]
-        valid_vox_z = vox_coords[valid_pts, 2]
-        tsdf_new = tsdf[valid_pts]
-        tsdf_vals = self.tsdf_volume[valid_vox_x, valid_vox_y, valid_vox_z]
-        tsdf_vals = tsdf_vals.astype(np.float32) * DIVSHORTMAX
-        w_old = self.weight_volume[valid_vox_x, valid_vox_y, valid_vox_z]
+        tsdf = depth_val - cam_pts[:, 2]
+        valid_pts = depth_val > 0
+        valid_pts &= tsdf >= -truncation_distance
+        tsdf[valid_pts] /= truncation_distance
+        tsdf[valid_pts] = np.minimum(1.0, tsdf[valid_pts])
+
         obs_weight = 1
-        tsdf_vol_new = (w_old * tsdf_vals + obs_weight * tsdf_new) / (w_old + obs_weight)
-        tsdf_vol_new = np.clip(
+        vx, vy, vz = np.moveaxis(voxel_coords[valid_pts], 1, 0)
+
+        # Integrate TSDF.
+        tsdf_new = tsdf[valid_pts]
+        tsdf_old = self.tsdf_volume[vx, vy, vz].astype(np.float32) * DIVSHORTMAX
+        w_old = self.weight_volume[vx, vy, vz]
+        w_new = w_old + obs_weight
+        tsdf_vol_new = (w_old * tsdf_old + obs_weight * tsdf_new) / w_new
+        self.tsdf_volume[vx, vy, vz] = np.clip(
             (tsdf_vol_new * SHORTMAX).astype(np.int16),
             a_min=-SHORTMAX,
             a_max=SHORTMAX,
         )
+        self.weight_volume[vx, vy, vz] = np.minimum(w_new, MAX_WEIGHT)
 
-        tsdf_volume_new[valid_vox_x, valid_vox_y, valid_vox_z] = tsdf_vol_new
-        w_new = np.minimum(w_old + obs_weight, MAX_WEIGHT)
-        weight_volume_new[valid_vox_x, valid_vox_y, valid_vox_z] = w_new
-
+        # Integrate color.
         for i in range(3):
-            color_volume_new[valid_vox_x, valid_vox_y, valid_vox_z, i] = (
-                (
-                    w_old * self.color_volume[valid_vox_x, valid_vox_y, valid_vox_z, i]
-                    + obs_weight * color_im[pix_y[valid_pts], pix_x[valid_pts], i]
-                )
-                / (w_old + obs_weight)
+            color_old = self.color_volume[vx, vy, vz, i]
+            color_new = color_im[pix_y[valid_pts], pix_x[valid_pts], i]
+            self.color_volume[vx, vy, vz, i] = (
+                (w_old * color_old + obs_weight * color_new) / w_new
             ).astype(np.uint8)
-
-        return replace(
-            self,
-            tsdf_volume=tsdf_volume_new,
-            weight_volume=weight_volume_new,
-            color_volume=color_volume_new,
-        )
 
 
 # ======================================================= #
 # Helper methods.
 # ======================================================= #
+
 
 def se3_inverse(se3: np.ndarray) -> np.ndarray:
     """Compute the inverse of an SE(3) transform."""
@@ -236,9 +244,13 @@ def se3_inverse(se3: np.ndarray) -> np.ndarray:
     return inv_se3
 
 
-def se3_transform(pts: np.ndarray, se3: np.ndarray) -> np.ndarray:
+def apply_se3(pts: np.ndarray, se3: np.ndarray) -> np.ndarray:
     """Apply an SE(3) transform to a pointcloud."""
-    return (se3[:3, :3] @ pts.T).T + se3[:3, 3]
+    # Turns out doing (se3[:3, :3] @ pts.T).T + se3[:3, 3] is slower because it makes
+    # a copy. This inplace version is roughly 2x faster!
+    o = (se3[:3, :3] @ pts.T).T
+    o += se3[:3, 3]
+    return o
 
 
 def extract_mesh(

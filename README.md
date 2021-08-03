@@ -1,12 +1,6 @@
 # Volumetric Fusion
 
-1. Download the dataset
-
-```bash
-bash download.sh
-```
-
-2. Create env and install dependencies.
+1. Create conda env and install dependencies.
 
 ```bash
 conda create -n fusion python=3.8
@@ -15,8 +9,8 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-3. Run
+2. Run
 
 ```bash
-python main.py
+python main.py --path <path/to/your/dataset/>
 ```
