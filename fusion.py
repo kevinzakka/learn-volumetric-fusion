@@ -23,12 +23,12 @@ class GlobalConfig:
     """The global configuration."""
 
     volume_size: Int3 = (512, 512, 512)
-    """The overall size of the volume in meters (m)."""
+    """The overall x, y, z dimensions of the volume."""
 
     voxel_scale: float = 0.02
-    """The volume discretization (in m)."""
+    """The volume discretization (in m), i.e. how much space each voxel occupies."""
 
-    truncation_distance: float = 20.0
+    truncation_distance: float = 0.1
     """The truncation distance (in m) for updating the TSDF volume."""
 
     depth_cutoff_distance: float = 4.0
@@ -56,11 +56,6 @@ class Intrinsic:
             ],
             dtype=np.float32,
         )
-
-    @staticmethod
-    def from_file(filename: Union[str, Path], width: int, height: int) -> Intrinsic:
-        mat = np.loadtxt(filename, delimiter=" ", dtype=np.float32)
-        return Intrinsic(width, height, mat[0, 0], mat[1, 1], mat[0, 2], mat[1, 2])
 
 
 @dataclass(frozen=True)
@@ -92,9 +87,6 @@ class TSDFVolume:
     world_pts: np.ndarray
     """Voxel coordinates in base camera frame."""
 
-    center_pt: np.ndarray
-    """Voxel center."""
-
     @staticmethod
     def initialize(camera_params: Intrinsic, config: GlobalConfig) -> TSDFVolume:
         # Allocate volumes.
@@ -105,14 +97,8 @@ class TSDFVolume:
         # Create voxel grid coordinates.
         voxel_coords = np.indices(config.volume_size).reshape(3, -1).T
 
-        # Compute center point.
-        center_pt = (
-            -0.5 * config.voxel_scale * np.array(config.volume_size, dtype=np.float32)
-        )
-
         # Convert voxel grid coordiantes to base frame camera coordinates.
         world_pts = (voxel_coords.astype(np.float32) + 0.5) * config.voxel_scale
-        world_pts += center_pt
 
         return TSDFVolume(
             camera_params,
@@ -122,7 +108,6 @@ class TSDFVolume:
             color_volume,
             voxel_coords,
             world_pts,
-            center_pt,
         )
 
     def integrate(
@@ -145,6 +130,10 @@ class TSDFVolume:
         # Truncate depth values >= than the cutoff.
         depth_im[depth_im >= self.config.depth_cutoff_distance] = 0.0
 
+        # Shift the voxel coordinate frame origin from the bottom left corner of the
+        # cube to the cube centroid.
+        pose[:3, 3] += np.array(self.config.volume_size) * self.config.voxel_scale * 0.5
+
         self._integrate(
             color_im,
             depth_im,
@@ -160,7 +149,6 @@ class TSDFVolume:
             self.tsdf_volume,
             self.color_volume,
             self.config.voxel_scale,
-            self.center_pt,
         )
 
     def _integrate(
@@ -257,13 +245,12 @@ def extract_mesh(
     tsdf_volume: np.ndarray,
     color_volume: np.ndarray,
     voxel_scale: float,
-    origin: np.ndarray,
 ) -> Mesh:
     """Extract a surface mesh from a TSDF volume using Marching Cubes."""
     tsdf_volume = tsdf_volume.astype(np.float32) * DIVSHORTMAX
     mask = (tsdf_volume > -0.5) & (tsdf_volume < 0.5)
     verts, faces, norms, _ = marching_cubes(tsdf_volume, mask=mask, level=0)
     vix, viy, viz = np.round(verts).astype(np.int16).T
-    verts = verts * voxel_scale + origin
+    verts = verts * voxel_scale
     colors = color_volume[vix, viy, viz]
     return verts, faces, norms, colors

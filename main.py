@@ -28,7 +28,7 @@ def main(_):
     # Instantiate global config.
     # These parameters should be tuned for each scene.
     config = fusion.GlobalConfig(
-        volume_size=(471, 300, 400),
+        volume_size=(512, 512, 512),
         voxel_scale=0.02,
         truncation_distance=5 * 0.02,
         depth_cutoff_distance=4.0,
