@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import abc
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Tuple, Union
+from typing import Tuple, Dict, List
 
 import numpy as np
 from skimage.measure import marching_cubes
@@ -58,13 +58,14 @@ class Intrinsic:
         )
 
 
-@dataclass(frozen=True)
-class TSDFVolume:
-    """A TSDF volume with a uniform voxel grid [1].
+# ======================================================= #
+# Volume implementations.
+# ======================================================= #
 
-    References:
-        [1]: Curless and Levoy, 1996.
-    """
+
+@dataclass(frozen=True)
+class TSDFVolume(abc.ABC):
+    """Base TSDF volume class."""
 
     camera_params: Intrinsic
     """The camera parameters."""
@@ -72,43 +73,22 @@ class TSDFVolume:
     config: GlobalConfig
     """The config values."""
 
-    tsdf_volume: np.ndarray
-    """The global volume in which depth frames are fused."""
-
-    weight_volume: np.ndarray
-    """Holds the weights of the moving average."""
-
-    color_volume: np.ndarray
-    """The global color volume in which color frames are fused."""
-
-    voxel_coords: np.ndarray
-    """Voxel grid coordinates."""
-
-    world_pts: np.ndarray
-    """Voxel coordinates in base camera frame."""
-
-    @staticmethod
+    @abc.abstractstaticmethod
     def initialize(camera_params: Intrinsic, config: GlobalConfig) -> TSDFVolume:
-        # Allocate volumes.
-        tsdf_volume = np.ones(config.volume_size, dtype=np.int16)
-        weight_volume = np.zeros(config.volume_size, dtype=np.int16)
-        color_volume = np.zeros(config.volume_size + (3,), dtype=np.uint8)
+        """Construct and return an instance of this class."""
 
-        # Create voxel grid coordinates.
-        voxel_coords = np.indices(config.volume_size).reshape(3, -1).T
-
-        # Convert voxel grid coordiantes to base frame camera coordinates.
-        world_pts = (voxel_coords.astype(np.float32) + 0.5) * config.voxel_scale
-
-        return TSDFVolume(
-            camera_params,
-            config,
-            tsdf_volume,
-            weight_volume,
-            color_volume,
-            voxel_coords,
-            world_pts,
-        )
+    @abc.abstractmethod
+    def _integrate(
+        self,
+        color_im: np.ndarray,
+        depth_im: np.ndarray,
+        pose: np.ndarray,
+        intr: Intrinsic,
+        truncation_distance: float,
+        voxel_coords: np.ndarray,
+        world_pts: np.ndarray,
+    ):
+        """Fuse RGB-D frame into volume."""
 
     def integrate(
         self,
@@ -130,14 +110,10 @@ class TSDFVolume:
         # Truncate depth values >= than the cutoff.
         depth_im[depth_im >= self.config.depth_cutoff_distance] = 0.0
 
-        # Shift the voxel coordinate frame origin from the bottom left corner of the
-        # cube to the cube centroid.
-        pose[:3, 3] += np.array(self.config.volume_size) * self.config.voxel_scale * 0.5
-
         self._integrate(
             color_im,
             depth_im,
-            se3_inverse(pose),
+            pose,
             self.camera_params,
             self.config.truncation_distance,
             self.voxel_coords,
@@ -145,10 +121,58 @@ class TSDFVolume:
         )
 
     def extract_mesh(self) -> Mesh:
-        return extract_mesh(
+        return marching_cubes(
             self.tsdf_volume,
             self.color_volume,
             self.config.voxel_scale,
+        )
+
+
+@dataclass(frozen=True)
+class UniformTSDFVolume(TSDFVolume):
+    """A TSDF volume with a uniform voxel grid.
+
+    References:
+        Curless and Levoy, 1996: A Volumetric Method for Building Complex Models from
+            Range Images.
+    """
+
+    tsdf_volume: np.ndarray
+    """The global volume in which depth frames are fused."""
+
+    weight_volume: np.ndarray
+    """Holds the weights of the moving average."""
+
+    color_volume: np.ndarray
+    """The global color volume in which color frames are fused."""
+
+    voxel_coords: np.ndarray
+    """Voxel grid coordinates."""
+
+    world_pts: np.ndarray
+    """Voxel coordinates in base camera frame."""
+
+    @staticmethod
+    def initialize(camera_params: Intrinsic, config: GlobalConfig) -> UniformTSDFVolume:
+        # Allocate volumes.
+        tsdf_volume = np.ones(config.volume_size, dtype=np.int16)
+        weight_volume = np.zeros(config.volume_size, dtype=np.int16)
+        color_volume = np.zeros(config.volume_size + (3,), dtype=np.uint8)
+
+        # Create voxel grid coordinates.
+        voxel_coords = np.indices(config.volume_size).reshape(3, -1).T
+
+        # Convert voxel grid coordiantes to base frame camera coordinates.
+        world_pts = (voxel_coords.astype(np.float32) + 0.5) * config.voxel_scale
+
+        return UniformTSDFVolume(
+            camera_params,
+            config,
+            tsdf_volume,
+            weight_volume,
+            color_volume,
+            voxel_coords,
+            world_pts,
         )
 
     def _integrate(
@@ -161,8 +185,12 @@ class TSDFVolume:
         voxel_coords: np.ndarray,
         world_pts: np.ndarray,
     ):
+        # Shift the voxel coordinate frame origin from the bottom left corner of the
+        # cube to the cube centroid.
+        pose[:3, 3] += np.array(self.config.volume_size) * self.config.voxel_scale * 0.5
+
         # Convert from base frame camera coordinates to current frame camera coordinates.
-        cam_pts = apply_se3(world_pts, pose)
+        cam_pts = apply_se3(world_pts, se3_inverse(pose))
 
         # Convert to camera pixels.
         with np.errstate(divide="ignore"):
@@ -217,6 +245,47 @@ class TSDFVolume:
             ).astype(np.uint8)
 
 
+@dataclass
+class Voxel:
+    """A voxel unit."""
+    tsdf: float
+    weight: int
+    color: Int3
+
+@dataclass
+class VoxelBlock:
+    """A block of voxels."""
+    voxels: List[Voxel]
+
+
+@dataclass(frozen=True)
+class HashTSDFVolume(TSDFVolume):
+    """A TSDF volume that uses a hashing scheme to store voxel data.
+
+    References:
+        Nießner et al, 2013: Real-time 3D Reconstruction at Scale using Voxel Hashing.
+    """
+
+    voxel_dict: Dict[np.ndarray, VoxelBlock] = {}
+
+    @staticmethod
+    def initialize(camera_params: Intrinsic, config: GlobalConfig) -> UniformTSDFVolume:
+        return HashTSDFVolume(
+            camera_params,
+            config,
+        )
+
+    def _integrate(
+        self,
+        color_im: np.ndarray,
+        depth_im: np.ndarray,
+        pose: np.ndarray,
+        intr: Intrinsic,
+        truncation_distance: float,
+        voxel_coords: np.ndarray,
+        world_pts: np.ndarray,
+    ):
+        pass
 # ======================================================= #
 # Helper methods.
 # ======================================================= #
@@ -241,7 +310,7 @@ def apply_se3(pts: np.ndarray, se3: np.ndarray) -> np.ndarray:
     return o
 
 
-def extract_mesh(
+def marching_cubes(
     tsdf_volume: np.ndarray,
     color_volume: np.ndarray,
     voxel_scale: float,
