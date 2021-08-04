@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Tuple, Union
+from typing import Tuple
 
 import numpy as np
-from skimage.measure import marching_cubes
+from skimage.measure import marching_cubes as skimage_marching_cubes
 
 # Global constants.
 BYTES_TO_GIGABYTES = 1.0 / (1 << 30)
@@ -145,7 +144,7 @@ class TSDFVolume:
         )
 
     def extract_mesh(self) -> Mesh:
-        return extract_mesh(
+        return marching_cubes(
             self.tsdf_volume,
             self.color_volume,
             self.config.voxel_scale,
@@ -186,6 +185,7 @@ class TSDFVolume:
         depth_val = np.zeros_like(pix_x, dtype=np.float32)
         depth_val[mask] = depth_im[pix_y[mask], pix_x[mask]]
 
+        # Compute SDF and truncate (tsdf).
         tsdf = depth_val - cam_pts[:, 2]
         valid_pts = depth_val > 0
         valid_pts &= tsdf >= -truncation_distance
@@ -241,7 +241,7 @@ def apply_se3(pts: np.ndarray, se3: np.ndarray) -> np.ndarray:
     return o
 
 
-def extract_mesh(
+def marching_cubes(
     tsdf_volume: np.ndarray,
     color_volume: np.ndarray,
     voxel_scale: float,
@@ -249,7 +249,7 @@ def extract_mesh(
     """Extract a surface mesh from a TSDF volume using Marching Cubes."""
     tsdf_volume = tsdf_volume.astype(np.float32) * DIVSHORTMAX
     mask = (tsdf_volume > -0.5) & (tsdf_volume < 0.5)
-    verts, faces, norms, _ = marching_cubes(tsdf_volume, mask=mask, level=0)
+    verts, faces, norms, _ = skimage_marching_cubes(tsdf_volume, mask=mask, level=0)
     vix, viy, viz = np.round(verts).astype(np.int16).T
     verts = verts * voxel_scale
     colors = color_volume[vix, viy, viz]

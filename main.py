@@ -13,6 +13,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string("path", "data", "Path to dataset.")
 flags.DEFINE_integer("save_freq", 25, "Frequency at which to dump mesh to disk.")
+flags.DEFINE_integer("fuse_freq", 1, "The step size between successive frames.")
 
 
 def main(_):
@@ -39,7 +40,7 @@ def main(_):
 
     # Loop through the RGB-D frames and integrate.
     start = time.time()
-    for i in tqdm(range(n_frames)):
+    for i in tqdm(range(0, n_frames, FLAGS.fuse_freq)):
         try:
             color_im = utils.load_color(path / f"frame-{i:06}.color.png")
             depth_im = utils.load_depth(path / f"frame-{i:06}.depth.png")
@@ -53,7 +54,8 @@ def main(_):
             mesh_args = volume.extract_mesh()
             utils.meshwrite("./mesh.ply", *mesh_args)
 
-    print(f"Average fps: {n_frames / (time.time() - start):.2}")
+    fps = n_frames / FLAGS.fuse_freq / (time.time() - start)
+    print(f"Average fps: {fps:,.2f}")
 
     mesh_args = volume.extract_mesh()
     utils.meshwrite("./mesh.ply", *mesh_args)
