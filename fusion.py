@@ -164,12 +164,13 @@ class TSDFVolume:
         cam_pts = apply_se3(world_pts, pose)
 
         # Convert to camera pixels.
+        pix_x, pix_y, pix_z = cam_pts.T
         with np.errstate(divide="ignore"):
-            pix_x = cam_pts[:, 0] / cam_pts[:, 2]
+            pix_x /= pix_z
             pix_x *= intr.fx
             pix_x += intr.cx
             pix_x = np.round(pix_x).astype(np.int32)
-            pix_y = cam_pts[:, 1] / cam_pts[:, 2]
+            pix_y /= pix_z
             pix_y *= intr.fy
             pix_y += intr.cy
             pix_y = np.round(pix_y).astype(np.int32)
@@ -177,7 +178,7 @@ class TSDFVolume:
         pix_y = np.nan_to_num(pix_y, copy=False, nan=0)
 
         # Eliminate pixels outside view frustum.
-        mask = cam_pts[:, 2] > 0
+        mask = pix_z > 0
         mask &= pix_x >= 0
         mask &= pix_x < intr.width
         mask &= pix_y >= 0
@@ -186,14 +187,14 @@ class TSDFVolume:
         depth_val[mask] = depth_im[pix_y[mask], pix_x[mask]]
 
         # Compute SDF and truncate (tsdf).
-        tsdf = depth_val - cam_pts[:, 2]
+        tsdf = depth_val - pix_z
         valid_pts = depth_val > 0
         valid_pts &= tsdf >= -truncation_distance
         tsdf[valid_pts] /= truncation_distance
         tsdf[valid_pts] = np.minimum(1.0, tsdf[valid_pts])
 
         obs_weight = 1
-        vx, vy, vz = np.moveaxis(voxel_coords[valid_pts], 1, 0)
+        vx, vy, vz = voxel_coords[valid_pts].T
 
         # Integrate TSDF.
         tsdf_new = tsdf[valid_pts]
