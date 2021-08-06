@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Tuple
 
+import cv2
 import numpy as np
 from skimage.measure import marching_cubes as skimage_marching_cubes
 
@@ -33,6 +35,14 @@ class GlobalConfig:
     depth_cutoff_distance: float = 4.0
     """The distance (in m) after which the depth is set to 0 in the depth frames."""
 
+    bilateral_kernel_size: int = 5
+    bilateral_color_sigma: float = 1.0
+    bilateral_spatial_sigma: float = 0.2
+    """Bilateral filter parameters."""
+
+    num_levels: int = 3
+    """Pyramid levels."""
+
 
 @dataclass(frozen=True)
 class Intrinsic:
@@ -46,6 +56,10 @@ class Intrinsic:
     cy: float
 
     @property
+    def resolution(self) -> Tuple[int, int]:
+        return (self.width, self.height)
+
+    @property
     def matrix(self) -> np.ndarray:
         return np.array(
             [
@@ -54,6 +68,19 @@ class Intrinsic:
                 [0.0, 0.0, 1.0],
             ],
             dtype=np.float32,
+        )
+
+    def level(self, level: int) -> Intrinsic:
+        """Returns intrinsic parameters at a specified pyramid level."""
+
+        scale_factor = math.pow(0.5, level)
+        return Intrinsic(
+            self.width >> level,
+            self.height >> level,
+            self.fx * scale_factor,
+            self.fy * scale_factor,
+            (self.cx + 0.5) * scale_factor - 0.5,
+            (self.cy + 0.5) * scale_factor - 0.5,
         )
 
 
@@ -219,6 +246,87 @@ class TSDFVolume:
 
 
 # ======================================================= #
+# Kinect fusion methods.
+# ======================================================= #
+
+
+def surface_measurement(
+    color_im: np.ndarray,
+    depth_im: np.ndarray,
+    intr: Intrinsic,
+    config: GlobalConfig,
+):
+    """Generate dense vertex and normal map pyramids."""
+
+    color_pyramid = {}
+    depth_pyramid = {}
+    smoothed_depth_pyramid = {}
+    vertex_pyramid = {}
+    normal_pyramid = {}
+
+    # Allocate pyramid buffers.
+    for level in range(config.num_levels):
+        width, height = intr.level(level).resolution
+        color_pyramid[level] = np.empty((height, width, 3), dtype=np.uint8)
+        depth_pyramid[level] = np.empty((height, width), dtype=np.float32)
+        smoothed_depth_pyramid[level] = np.empty((height, width), dtype=np.float32)
+        vertex_pyramid[level] = np.empty((height, width, 3), dtype=np.float32)
+        normal_pyramid[level] = np.empty((height, width, 3), dtype=np.float32)
+
+    # 0-level is the current depth frame.
+    depth_pyramid[0] = depth_im
+    color_pyramid[0] = color_im
+
+    # Build pyramids.
+    for level in range(1, config.num_levels):
+        cv2.pyrDown(depth_pyramid[level - 1], dst=depth_pyramid[level])
+
+    # Bilaterally filter depth pyramids.
+    for level in range(config.num_levels):
+        cv2.bilateralFilter(
+            src=depth_pyramid[level],
+            d=config.bilateral_kernel_size,
+            sigmaColor=config.bilateral_color_sigma,
+            sigmaSpace=config.bilateral_spatial_sigma,
+            borderType=cv2.BORDER_DEFAULT,
+            dst=smoothed_depth_pyramid[level],
+        )
+
+    # Compute vertex and normal maps.
+    for level in range(config.num_levels):
+        vertex_pyramid[level] = compute_vertex_map(
+            smoothed_depth_pyramid[level],
+            config.depth_cutoff_distance,
+            intr.level(level),
+        )
+        normal_pyramid[level] = compute_normals_map(vertex_pyramid[level])
+
+    return (
+        color_pyramid,
+        depth_pyramid,
+        smoothed_depth_pyramid,
+        vertex_pyramid,
+        normal_pyramid,
+    )
+
+
+def pose_estimation():
+    """Camera pose estimation.
+
+    Uses multi-scale ICP alignment between the predicted surface and current sensor
+    measurement.
+    """
+
+
+def surface_prediction():
+    """Dense surface prediction from TSDF.
+
+    Raycasts the signed distance function into the estimated frame to provide a dense
+    surface prediction.
+    """
+
+
+# ======================================================= #
 # Helper methods.
 # ======================================================= #
 
@@ -255,3 +363,34 @@ def marching_cubes(
     verts = verts * voxel_scale
     colors = color_volume[vix, viy, viz]
     return verts, faces, norms, colors
+
+
+def compute_vertex_map(
+    depth_im: np.ndarray,
+    depth_cutoff_distance: float,
+    intr: Intrinsic,
+) -> np.ndarray:
+    """Back-project a depth image into a 3D pointcloud."""
+    cc, rr = np.meshgrid(np.arange(intr.width), np.arange(intr.height), sparse=True)
+    valid = (depth_im > 0) & (depth_im < depth_cutoff_distance)
+    z = np.where(valid, depth_im, 0)
+    x = np.where(valid, z * (cc - intr.cx) / intr.fx, 0)
+    y = np.where(valid, z * (rr - intr.cy) / intr.fy, 0)
+    return np.stack([x, y, z], axis=-1).astype(np.float32)  # (H, W, 3)
+
+
+def compute_normals_map(vmap: np.ndarray) -> np.ndarray:
+    """Compute normal vectors from vertex map."""
+    assert vmap.ndim == 3
+    assert vmap.shape[-1] == 3
+    height, width = vmap.shape[:2]
+    hor = vmap[0 : height - 2, 1 : width - 1] - vmap[2:height, 1 : width - 1]
+    ver = vmap[1 : height - 1, 0 : width - 2] - vmap[1 : height - 1, 2:width]
+    nmap = np.zeros_like(vmap)
+    nmap[1 : height - 1, 1 : width - 1] = np.cross(hor, ver)
+    nmap[1 : height - 1, 1 : width - 1] /= (
+        np.linalg.norm(nmap[1 : height - 1, 1 : width - 1], axis=-1, keepdims=True)
+        + 1e-10
+    )
+    nmap[nmap[:, :, 2] > 0] *= -1
+    return nmap
