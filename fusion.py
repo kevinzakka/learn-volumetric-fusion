@@ -1,8 +1,15 @@
+"""Volumetric TSDF integration.
+
+Curless and Levoy, 1996: A Volumetric Method for Building Complex Models from Range Images.
+Newcombe et al., 2011: KinectFusion: Real-Time Dense Surface Mapping and Tracking.
+"""
+
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Tuple
 
 import cv2
 import numpy as np
@@ -17,6 +24,9 @@ MAX_WEIGHT = 128
 # Global types.
 Int3 = Tuple[int, int, int]
 Mesh = Tuple[np.ndarray, ...]
+PyramidArray = Dict[int, np.ndarray]
+
+from ipdb import set_trace
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,15 @@ class GlobalConfig:
 
     num_levels: int = 3
     """Pyramid levels."""
+
+    icp_distance_threshold: float = 0.01
+    icp_angle_threshold: float = 20.0
+    icp_iterations: Tuple[int, int, int] = (10, 5, 4)
+    """ICP parameters."""
+
+    def __post_init__(self):
+        assert len(self.volume_size) == 3
+        assert len(self.icp_iterations) == self.num_levels
 
 
 @dataclass(frozen=True)
@@ -84,13 +103,63 @@ class Intrinsic:
         )
 
 
-@dataclass(frozen=True)
-class TSDFVolume:
-    """A TSDF volume with a uniform voxel grid [1].
+@dataclass
+class FrameObservation:
+    """Carries raw and pre-processed frame data obtained from an RGB-D sensor."""
 
-    References:
-        [1]: Curless and Levoy, 1996.
-    """
+    color_pyramid: PyramidArray
+    depth_pyramid: PyramidArray
+    smoothed_depth_pyramid: PyramidArray
+    vertex_pyramid: PyramidArray
+    normal_pyramid: PyramidArray
+
+    @staticmethod
+    def initialize(camera_params: Intrinsic, config: GlobalConfig) -> FrameObservation:
+        color_pyramid = dict()
+        depth_pyramid, smoothed_depth_pyramid = dict(), dict()
+        vertex_pyramid, normal_pyramid = dict(), dict()
+
+        for level in range(config.num_levels):
+            width, height = camera_params.level(level).resolution
+            color_pyramid[level] = np.empty((height, width, 3), dtype=np.uint8)
+            depth_pyramid[level] = np.empty((height, width), dtype=np.float32)
+            smoothed_depth_pyramid[level] = np.empty((height, width), dtype=np.float32)
+            vertex_pyramid[level] = np.empty((height, width, 3), dtype=np.float32)
+            normal_pyramid[level] = np.empty((height, width, 3), dtype=np.float32)
+
+        return FrameObservation(
+            color_pyramid,
+            depth_pyramid,
+            smoothed_depth_pyramid,
+            vertex_pyramid,
+            normal_pyramid,
+        )
+
+
+@dataclass
+class FrameRender:
+    """Carries frame data rendered via raycasting the internal TSDF volume."""
+
+    color_pyramid: PyramidArray
+    vertex_pyramid: PyramidArray
+    normal_pyramid: PyramidArray
+
+    @staticmethod
+    def initialize(camera_params: Intrinsic, config: GlobalConfig) -> FrameRender:
+        color_pyramid, vertex_pyramid, normal_pyramid = dict(), dict(), dict()
+
+        for level in range(config.num_levels):
+            width, height = camera_params.level(level).resolution
+            color_pyramid[level] = np.empty((height, width, 3), dtype=np.uint8)
+            vertex_pyramid[level] = np.empty((height, width, 3), dtype=np.float32)
+            normal_pyramid[level] = np.empty((height, width, 3), dtype=np.float32)
+
+        return FrameRender(color_pyramid, vertex_pyramid, normal_pyramid)
+
+
+@dataclass(frozen=False)
+class TSDFVolume:
+    """A TSDF volume with a uniform voxel grid."""
 
     camera_params: Intrinsic
     """The camera parameters."""
@@ -113,6 +182,11 @@ class TSDFVolume:
     world_pts: np.ndarray
     """Voxel coordinates in base camera frame."""
 
+    frame_render: FrameRender
+
+    current_pose: np.ndarray
+    """Current estimated pose of the camera wrt world frame."""
+
     @staticmethod
     def initialize(camera_params: Intrinsic, config: GlobalConfig) -> TSDFVolume:
         # Allocate volumes.
@@ -126,6 +200,13 @@ class TSDFVolume:
         # Convert voxel grid coordiantes to base frame camera coordinates.
         world_pts = (voxel_coords.astype(np.float32) + 0.5) * config.voxel_scale
 
+        # Initialize first camera pose estimate in the middle of the volume.
+        current_pose = np.eye(4)
+        for i in range(3):
+            current_pose[i, 3] = 0.5 * config.volume_size[i] * config.voxel_scale
+
+        frame_render = FrameRender.initialize(camera_params, config)
+
         return TSDFVolume(
             camera_params,
             config,
@@ -134,18 +215,19 @@ class TSDFVolume:
             color_volume,
             voxel_coords,
             world_pts,
+            frame_render,
+            current_pose,
         )
 
     def integrate(
         self,
         color_im: np.ndarray,
         depth_im: np.ndarray,
-        pose: np.ndarray,
+        frame_id: int,
     ):
         """Integrate an RGB-D frame into the TSDF volume."""
 
         # Sanity check shapes.
-        assert pose.shape == (4, 4)
         assert color_im.shape[:2] == depth_im.shape[:2]
         if (
             depth_im.shape[0] != self.camera_params.height
@@ -153,22 +235,65 @@ class TSDFVolume:
         ):
             raise ValueError("Depth image size does not match camera parameters.")
 
-        # Truncate depth values >= than the cutoff.
-        depth_im[depth_im >= self.config.depth_cutoff_distance] = 0.0
-
-        # Shift the voxel coordinate frame origin from the bottom left corner of the
-        # cube to the cube centroid.
-        pose[:3, 3] += np.array(self.config.volume_size) * self.config.voxel_scale * 0.5
-
-        self._integrate(
+        # 1. Surface measurement.
+        tic = time.time()
+        frame = FrameObservation.initialize(self.camera_params, self.config)
+        surface_measurement(
             color_im,
             depth_im,
-            se3_inverse(pose),
+            frame,
+            self.camera_params,
+            self.config.num_levels,
+            self.config.bilateral_kernel_size,
+            self.config.bilateral_color_sigma,
+            self.config.bilateral_spatial_sigma,
+            self.config.depth_cutoff_distance,
+        )
+        print(f"Surface measurement completed in {time.time() - tic}s")
+
+        # # 2. Pose estimation.
+        # tic = time.time()
+        # if frame_id > 0:
+        #     pose_estimation(
+        #         self.current_pose,
+        #         frame,
+        #         self.camera_params,
+        #         self.config.num_levels,
+        #         self.config.icp_distance_threshold,
+        #         self.config.icp_angle_threshold,
+        #         self.config.icp_iterations,
+        #     )
+        # print(f"ICP completed in {time.time() - tic}s")
+
+        # 3. Surface reconstruction.
+        tic = time.time()
+        surface_reconstruction(
+            frame.color_pyramid[0],
+            frame.depth_pyramid[0],
+            se3_inverse(self.current_pose),
             self.camera_params,
             self.config.truncation_distance,
             self.voxel_coords,
             self.world_pts,
+            self.tsdf_volume,
+            self.weight_volume,
+            self.color_volume,
         )
+        print(f"Surface reconstruction completed in {time.time() - tic}s")
+
+        # 4. Surface prediction.
+        tic = time.time()
+        for level in range(self.config.num_levels):
+            surface_prediction(
+                self.tsdf_volume,
+                self.camera_params.level(level),
+                self.config.truncation_distance,
+                self.current_pose,
+                self.frame_render.color_pyramid[level],
+                self.frame_render.vertex_pyramid[level],
+                self.frame_render.normal_pyramid[level],
+            )
+        print(f"Surface prediction completed in {time.time() - tic}s")
 
     def extract_mesh(self) -> Mesh:
         return marching_cubes(
@@ -176,73 +301,6 @@ class TSDFVolume:
             self.color_volume,
             self.config.voxel_scale,
         )
-
-    def _integrate(
-        self,
-        color_im: np.ndarray,
-        depth_im: np.ndarray,
-        pose: np.ndarray,
-        intr: Intrinsic,
-        truncation_distance: float,
-        voxel_coords: np.ndarray,
-        world_pts: np.ndarray,
-    ):
-        # Convert from base frame camera coordinates to current frame camera coordinates.
-        cam_pts = apply_se3(world_pts, pose)
-
-        # Convert to camera pixels.
-        pix_x, pix_y, pix_z = cam_pts.T
-        with np.errstate(divide="ignore"):
-            pix_x /= pix_z
-            pix_x *= intr.fx
-            pix_x += intr.cx
-            pix_x = np.round(pix_x).astype(np.int32)
-            pix_y /= pix_z
-            pix_y *= intr.fy
-            pix_y += intr.cy
-            pix_y = np.round(pix_y).astype(np.int32)
-        pix_x = np.nan_to_num(pix_x, copy=False, nan=0)
-        pix_y = np.nan_to_num(pix_y, copy=False, nan=0)
-
-        # Eliminate pixels outside view frustum.
-        mask = pix_z > 0
-        mask &= pix_x >= 0
-        mask &= pix_x < intr.width
-        mask &= pix_y >= 0
-        mask &= pix_y < intr.height
-        depth_val = np.zeros_like(pix_x, dtype=np.float32)
-        depth_val[mask] = depth_im[pix_y[mask], pix_x[mask]]
-
-        # Compute SDF and truncate (tsdf).
-        tsdf = depth_val - pix_z
-        valid_pts = depth_val > 0
-        valid_pts &= tsdf >= -truncation_distance
-        tsdf[valid_pts] /= truncation_distance
-        tsdf[valid_pts] = np.minimum(1.0, tsdf[valid_pts])
-
-        obs_weight = 1
-        vx, vy, vz = voxel_coords[valid_pts].T
-
-        # Integrate TSDF.
-        tsdf_new = tsdf[valid_pts]
-        tsdf_old = self.tsdf_volume[vx, vy, vz].astype(np.float32) * DIVSHORTMAX
-        w_old = self.weight_volume[vx, vy, vz]
-        w_new = w_old + obs_weight
-        tsdf_vol_new = (w_old * tsdf_old + obs_weight * tsdf_new) / w_new
-        self.tsdf_volume[vx, vy, vz] = np.clip(
-            (tsdf_vol_new * SHORTMAX).astype(np.int16),
-            a_min=-SHORTMAX,
-            a_max=SHORTMAX,
-        )
-        self.weight_volume[vx, vy, vz] = np.minimum(w_new, MAX_WEIGHT)
-
-        # Integrate color.
-        for i in range(3):
-            color_old = self.color_volume[vx, vy, vz, i]
-            color_new = color_im[pix_y[valid_pts], pix_x[valid_pts], i]
-            self.color_volume[vx, vy, vz, i] = (
-                (w_old * color_old + obs_weight * color_new) / w_new
-            ).astype(np.uint8)
 
 
 # ======================================================= #
@@ -253,76 +311,163 @@ class TSDFVolume:
 def surface_measurement(
     color_im: np.ndarray,
     depth_im: np.ndarray,
+    frame: FrameObservation,
     intr: Intrinsic,
-    config: GlobalConfig,
+    num_levels: int,
+    bilateral_kernel_size: int,
+    bilateral_color_sigma: float,
+    bilateral_spatial_sigma: float,
+    depth_cutoff_distance: float,
 ):
-    """Generate dense vertex and normal map pyramids."""
-
-    color_pyramid = {}
-    depth_pyramid = {}
-    smoothed_depth_pyramid = {}
-    vertex_pyramid = {}
-    normal_pyramid = {}
-
-    # Allocate pyramid buffers.
-    for level in range(config.num_levels):
-        width, height = intr.level(level).resolution
-        color_pyramid[level] = np.empty((height, width, 3), dtype=np.uint8)
-        depth_pyramid[level] = np.empty((height, width), dtype=np.float32)
-        smoothed_depth_pyramid[level] = np.empty((height, width), dtype=np.float32)
-        vertex_pyramid[level] = np.empty((height, width, 3), dtype=np.float32)
-        normal_pyramid[level] = np.empty((height, width, 3), dtype=np.float32)
-
-    # 0-level is the current depth frame.
-    depth_pyramid[0] = depth_im
-    color_pyramid[0] = color_im
-
+    """Generate dense vertex and normal map pyramids from raw RGB-D frames."""
     # Build pyramids.
-    for level in range(1, config.num_levels):
-        cv2.pyrDown(depth_pyramid[level - 1], dst=depth_pyramid[level])
+    frame.color_pyramid[0] = color_im
+    frame.depth_pyramid[0] = depth_im
+    for level in range(1, num_levels):
+        # In the paper, depth values are used in the Gaussian pyramid average only if
+        # they are within 3σr of the central pixel to ensure smoothing does not occur
+        # over depth boundaries. We don't have control over this when we use opencv's
+        # pyrDown method.
+        cv2.pyrDown(frame.depth_pyramid[level - 1], dst=frame.depth_pyramid[level])
 
     # Bilaterally filter depth pyramids.
-    for level in range(config.num_levels):
+    for level in range(num_levels):
         cv2.bilateralFilter(
-            src=depth_pyramid[level],
-            d=config.bilateral_kernel_size,
-            sigmaColor=config.bilateral_color_sigma,
-            sigmaSpace=config.bilateral_spatial_sigma,
+            src=frame.depth_pyramid[level],
+            d=bilateral_kernel_size,
+            sigmaColor=bilateral_color_sigma,
+            sigmaSpace=bilateral_spatial_sigma,
             borderType=cv2.BORDER_DEFAULT,
-            dst=smoothed_depth_pyramid[level],
+            dst=frame.smoothed_depth_pyramid[level],
         )
 
     # Compute vertex and normal maps.
-    for level in range(config.num_levels):
-        vertex_pyramid[level] = compute_vertex_map(
-            smoothed_depth_pyramid[level],
-            config.depth_cutoff_distance,
+    for level in range(num_levels):
+        frame.vertex_pyramid[level] = compute_vertex_map(
+            frame.smoothed_depth_pyramid[level],
+            depth_cutoff_distance,
             intr.level(level),
         )
-        normal_pyramid[level] = compute_normals_map(vertex_pyramid[level])
-
-    return (
-        color_pyramid,
-        depth_pyramid,
-        smoothed_depth_pyramid,
-        vertex_pyramid,
-        normal_pyramid,
-    )
+        frame.normal_pyramid[level] = compute_normals_map(frame.vertex_pyramid[level])
 
 
-def pose_estimation():
+def pose_estimation(
+    current_pose: np.ndarray,
+    frame: FrameObservation,
+    intr: Intrinsic,
+    num_levels: int,
+    icp_distance_threshold: float,
+    icp_angle_threshold: float,
+    icp_iterations: Tuple[int, int, int],
+):
     """Camera pose estimation.
 
     Uses multi-scale ICP alignment between the predicted surface and current sensor
-    measurement.
+    measurement to estimate the sensor pose.
+
+    Assumptions:
+        High frame-rate -> small motion from one frame to the next. Can use fast
+        projective data association algorithm to obtain correspondence and the
+        point-plane metric for pose optimization.
+
+    References:
+        Blais and Levine, 1993: Registering Multiview Range Data to Create 3D
+            Computer Objects. (Projection-based matching).
+        Chen and Medioni, 1991: Object Modeling by Registration of Multiple Range
+            Images. (Point-to-plane error metric)
     """
+    pass
 
 
-def surface_prediction():
-    """Dense surface prediction from TSDF.
+def surface_reconstruction(
+    color_im: np.ndarray,
+    depth_im: np.ndarray,
+    pose: np.ndarray,
+    intr: Intrinsic,
+    truncation_distance: float,
+    voxel_coords: np.ndarray,
+    world_pts: np.ndarray,
+    tsdf_volume: np.ndarray,
+    weight_volume: np.ndarray,
+    color_volume: np.ndarray,
+):
+    """Fuse the surface measurement into the global TSDF volume."""
+    # Convert from base frame camera coordinates to current frame camera coordinates.
+    cam_pts = apply_se3(world_pts, pose)
 
-    Raycasts the signed distance function into the estimated frame to provide a dense
-    surface prediction.
+    # Convert to camera pixels.
+    pix_x, pix_y, pix_z = cam_pts.T
+    with np.errstate(divide="ignore"):
+        pix_x /= pix_z
+        pix_x *= intr.fx
+        pix_x += intr.cx
+        pix_x = np.round(pix_x).astype(np.int32)
+        pix_y /= pix_z
+        pix_y *= intr.fy
+        pix_y += intr.cy
+        pix_y = np.round(pix_y).astype(np.int32)
+    pix_x = np.nan_to_num(pix_x, copy=False, nan=0)
+    pix_y = np.nan_to_num(pix_y, copy=False, nan=0)
+
+    # Eliminate pixels outside view frustum.
+    mask = pix_z > 0
+    mask &= pix_x >= 0
+    mask &= pix_x < intr.width
+    mask &= pix_y >= 0
+    mask &= pix_y < intr.height
+    depth_val = np.zeros_like(pix_x, dtype=np.float32)
+    depth_val[mask] = depth_im[pix_y[mask], pix_x[mask]]
+
+    # Compute SDF and truncate (tsdf).
+    tsdf = depth_val - pix_z
+    valid_pts = depth_val > 0
+    valid_pts &= tsdf >= -truncation_distance
+    tsdf[valid_pts] /= truncation_distance
+    tsdf[valid_pts] = np.minimum(1.0, tsdf[valid_pts])
+
+    obs_weight = 1
+    vx, vy, vz = voxel_coords[valid_pts].T
+
+    # Integrate TSDF.
+    tsdf_new = tsdf[valid_pts]
+    tsdf_old = tsdf_volume[vx, vy, vz].astype(np.float32) * DIVSHORTMAX
+    w_old = weight_volume[vx, vy, vz]
+    w_new = w_old + obs_weight
+    tsdf_vol_new = (w_old * tsdf_old + obs_weight * tsdf_new) / w_new
+    tsdf_volume[vx, vy, vz] = np.clip(
+        (tsdf_vol_new * SHORTMAX).astype(np.int16),
+        a_min=-SHORTMAX,
+        a_max=SHORTMAX,
+    )
+    weight_volume[vx, vy, vz] = np.minimum(w_new, MAX_WEIGHT)
+
+    # Integrate color.
+    for i in range(3):
+        color_old = color_volume[vx, vy, vz, i]
+        color_new = color_im[pix_y[valid_pts], pix_x[valid_pts], i]
+        color_volume[vx, vy, vz, i] = (
+            (w_old * color_old + obs_weight * color_new) / w_new
+        ).astype(np.uint8)
+
+
+def surface_prediction(
+    tsdf_volume: np.ndarray,
+    intr: Intrinsic,
+    truncation_distance: float,
+    current_pose: np.ndarray,
+    color_pyramid: np.ndarray,
+    vertex_pyramid: np.ndarray,
+    normal_pyramid: np.ndarray,
+):
+    """Raycasts the TSDF volume from the current estimated pose.
+
+    This generates a view of the implicit surface at the current pose in the form of
+    vertex and normal maps which are used in the subsequence ICP iteration.
+
+    Ideally, this is implemented on a GPU where all pixel rays are run in parallel.
+
+    References:
+        Parker et al, 1998: Interactive Ray Tracing for Isosurface Rendering.
     """
 
 
@@ -381,8 +526,7 @@ def compute_vertex_map(
 
 def compute_normals_map(vmap: np.ndarray) -> np.ndarray:
     """Compute normal vectors from vertex map."""
-    assert vmap.ndim == 3
-    assert vmap.shape[-1] == 3
+    assert vmap.ndim == 3 and vmap.shape[-1] == 3
     height, width = vmap.shape[:2]
     hor = vmap[0 : height - 2, 1 : width - 1] - vmap[2:height, 1 : width - 1]
     ver = vmap[1 : height - 1, 0 : width - 2] - vmap[1 : height - 1, 2:width]
