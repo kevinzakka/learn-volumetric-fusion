@@ -12,8 +12,9 @@ import utils
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("path", "data", "Path to dataset.")
+flags.DEFINE_float("voxel_scale", 0.03, "The size of each voxel in meters.")
 flags.DEFINE_integer("save_freq", 25, "Frequency at which to dump mesh to disk.")
-flags.DEFINE_integer("fuse_freq", 1, "The step size between successive frames.")
+flags.DEFINE_integer("fuse_freq", 25, "The step size between successive frames.")
 
 
 def main(_):
@@ -30,8 +31,8 @@ def main(_):
     # These parameters should be tuned for each scene.
     config = fusion.GlobalConfig(
         volume_size=(512, 512, 512),
-        voxel_scale=0.02,
-        truncation_distance=5 * 0.02,
+        voxel_scale=FLAGS.voxel_scale,
+        truncation_distance=5 * FLAGS.voxel_scale,
         depth_cutoff_distance=4.0,
     )
 
@@ -40,25 +41,26 @@ def main(_):
 
     # Loop through the RGB-D frames and integrate.
     start = time.time()
+    n_frames = 25
     for i in tqdm(range(0, n_frames, FLAGS.fuse_freq)):
         try:
-            color_im = utils.load_color(path / f"frame-{i:06}.color.png")
+            color_im = utils.load_color(path / f"frame-{i:06}.color.jpg")
             depth_im = utils.load_depth(path / f"frame-{i:06}.depth.png")
             pose = utils.load_pose(path / f"frame-{i:06}.pose.txt")
         except:
             continue
 
-        volume.integrate(color_im, depth_im, pose)
+        volume.integrate(color_im, depth_im, i, pose)
 
-        if not i % FLAGS.save_freq:
-            mesh_args = volume.extract_mesh()
-            utils.meshwrite("./mesh.ply", *mesh_args)
+    #     if not i % FLAGS.save_freq:
+    #         mesh_args = volume.extract_mesh()
+    #         utils.meshwrite("./mesh.ply", *mesh_args)
 
     fps = n_frames / FLAGS.fuse_freq / (time.time() - start)
     print(f"Average fps: {fps:,.2f}")
 
-    mesh_args = volume.extract_mesh()
-    utils.meshwrite("./mesh.ply", *mesh_args)
+    # mesh_args = volume.extract_mesh()
+    # utils.meshwrite("./mesh.ply", *mesh_args)
 
 
 if __name__ == "__main__":
