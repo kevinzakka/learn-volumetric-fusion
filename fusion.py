@@ -13,6 +13,7 @@ from typing import Dict, Tuple
 
 import cv2
 import numpy as np
+from numpy.linalg.linalg import norm
 from skimage.measure import marching_cubes as skimage_marching_cubes
 
 # Global constants.
@@ -27,6 +28,7 @@ Mesh = Tuple[np.ndarray, ...]
 PyramidArray = Dict[int, np.ndarray]
 
 from ipdb import set_trace
+
 from debug import visualize_normal_map, visualize_pc_o3d
 
 
@@ -286,21 +288,21 @@ class TSDFVolume:
         )
         print(f"Surface reconstruction completed in {time.time() - tic}s")
 
-        # 4. Surface prediction.
-        tic = time.time()
-        for level in range(self.config.num_levels):
-            surface_prediction(
-                self.tsdf_volume,
-                self.config.volume_size,
-                self.config.voxel_scale,
-                self.camera_params.level(level),
-                self.config.truncation_distance,
-                self.current_pose,
-                self.frame_render.color_pyramid[level],
-                self.frame_render.vertex_pyramid[level],
-                self.frame_render.normal_pyramid[level],
-            )
-        print(f"Surface prediction completed in {time.time() - tic}s")
+        # # 4. Surface prediction.
+        # tic = time.time()
+        # for level in range(self.config.num_levels):
+        #     surface_prediction(
+        #         self.tsdf_volume,
+        #         self.config.volume_size,
+        #         self.config.voxel_scale,
+        #         self.camera_params.level(level),
+        #         self.config.truncation_distance,
+        #         self.current_pose,
+        #         self.frame_render.color_pyramid[level],
+        #         self.frame_render.vertex_pyramid[level],
+        #         self.frame_render.normal_pyramid[level],
+        #     )
+        # print(f"Surface prediction completed in {time.time() - tic}s")
 
     def extract_mesh(self) -> Mesh:
         return marching_cubes(
@@ -353,19 +355,23 @@ def surface_measurement(
 
     # Compute vertex and normal maps.
     for level in range(num_levels):
+        tic = time.time()
         frame.vertex_pyramid[level] = compute_vertex_map(
             frame.smoothed_depth_pyramid[level],
             depth_cutoff_distance,
             intr.level(level),
         )
+        print(f"Vertex map computation took: {time.time() - tic}s")
+        tic = time.time()
         frame.normal_pyramid[level] = compute_normals_map(frame.vertex_pyramid[level])
+        print(f"Normal map computation took: {time.time() - tic}s")
 
         # # Visualize pointcloud and normals.
         # if level == 0:
         #     visualize_normal_map(frame.normal_pyramid[level], se3_inverse(pose_gt))
         #     visualize_pc_o3d(
         #         frame.vertex_pyramid[level].reshape(-1, 3),
-        #         frame.color_pyramid[level].reshape(-1, 3).copy() / 255.,
+        #         frame.color_pyramid[level].reshape(-1, 3).copy() / 255.0,
         #         frame.normal_pyramid[level].reshape(-1, 3),
         #         downsample=0.03,
         #     )
@@ -491,17 +497,10 @@ def surface_prediction(
     References:
         Parker et al, 1998: Interactive Ray Tracing for Isosurface Rendering.
     """
+
     def trilerp():
+        """Trilinearly interpolate SDF value."""
         pass
-
-    def get_nearest(origin, direction, volume_range):
-        set_trace()
-
-    def get_furthest(origin, direction, volume_range):
-        pass
-
-    # Compute volume range.
-    volume_range = np.asarray(volume_size) * voxel_scale
 
     # Compute a direction vector from the camera center through each pixel in world
     # coordinates.
@@ -511,11 +510,8 @@ def surface_prediction(
     rays /= np.linalg.norm(rays, axis=0, keepdims=True)
 
     # Calculate ray length.
-    translation = current_pose[:3, 3]
-    near = get_nearest(translation, rays, volume_range)
-    far = get_furthest(translation, rays, volume_range)
+    volume_range = np.asarray(volume_size) * voxel_scale
 
-    set_trace()
 
 # ======================================================= #
 # Helper methods.
@@ -565,31 +561,38 @@ def compute_vertex_map(
     cc, rr = np.meshgrid(np.arange(intr.width), np.arange(intr.height), sparse=True)
     valid = (depth_im > 0) & (depth_im < depth_cutoff_distance)
     z = np.where(valid, depth_im, 0.0)
-    x = np.where(valid, z * (cc - intr.cx) / intr.fx, 0.0)
-    y = np.where(valid, z * (rr - intr.cy) / intr.fy, 0.0)
-    return np.stack([x, y, z], axis=-1).astype(np.float32)  # (H, W, 3)
+    x = np.where(valid, z * (cc - intr.cx).astype(np.float32) / intr.fx, 0.0)
+    y = np.where(valid, z * (rr - intr.cy).astype(np.float32) / intr.fy, 0.0)
+    return np.stack([x, y, z], axis=-1)  # (H, W, 3)
 
 
+# TODO(kevin): Consider casting to float64 to increase accuracy.
 def compute_normals_map(vmap: np.ndarray) -> np.ndarray:
-    """Compute normal vectors from vertex map.
+    """Compute normal vectors from a vertex map.
 
     Assumes neighbouring pixels in the vertex map correspond to neighboring vertices
-    in the scene. Concretely, given a vertex map V, this function calculates a normal
-    map N as follows:
+    in the scene. Concretely, given a vertex map V of shape (H, W, 3), this function
+    returns a dense normal map N of same shape (H, W, 3) such that:
 
-        `N[x, y] = norm((V[x + 1, y] - V[x - 1, y]) x (V[x, y + 1] - V[x, y - 1]))`
+        N[y, x] = (V[y - 1, x] - V[y + 1, x]) x (V[y, x - 1] - V[y, x + 1])
+        N[y, x] /= L2_norm(N[y, x])
     """
     assert vmap.ndim == 3 and vmap.shape[-1] == 3
     height, width = vmap.shape[:2]
-    hor = vmap[0 : height - 2, 1 : width - 1] - vmap[2:height, 1 : width - 1]
-    ver = vmap[1 : height - 1, 0 : width - 2] - vmap[1 : height - 1, 2:width]
-    cross = np.cross(hor, ver)
+    upper = vmap[0 : height - 2, 1 : width - 1]
+    lower = vmap[2:height, 1 : width - 1]
+    vertical = upper - lower  # This vector points up.
+    left = vmap[1 : height - 1, 0 : width - 2]
+    right = vmap[1 : height - 1, 2:width]
+    horizontal = left - right  # This vector points left.
+    cross = np.cross(vertical, horizontal)  # Right-hand rule.
     nmap = np.zeros_like(vmap)
     nmap[1 : height - 1, 1 : width - 1] = cross
     nmap[1 : height - 1, 1 : width - 1] /= (
         np.linalg.norm(nmap[1 : height - 1, 1 : width - 1], axis=-1, keepdims=True)
         + 1e-10
     )
-    # NaN-ify normals where the original vertex depth value was invalid.
+    # NaN-ify normals where the original vertex depth value was invalid and thus set to
+    # 0 in `compute_vertex_map`.
     nmap[vmap[..., -1] == 0.0] = np.nan
     return nmap
