@@ -251,6 +251,7 @@ class TSDFVolume:
             self.config.bilateral_color_sigma,
             self.config.bilateral_spatial_sigma,
             self.config.depth_cutoff_distance,
+            pose,
         )
         print(f"Surface measurement completed in {time.time() - tic}s")
 
@@ -290,6 +291,8 @@ class TSDFVolume:
         for level in range(self.config.num_levels):
             surface_prediction(
                 self.tsdf_volume,
+                self.config.volume_size,
+                self.config.voxel_scale,
                 self.camera_params.level(level),
                 self.config.truncation_distance,
                 self.current_pose,
@@ -322,6 +325,7 @@ def surface_measurement(
     bilateral_color_sigma: float,
     bilateral_spatial_sigma: float,
     depth_cutoff_distance: float,
+    pose_gt: np.ndarray,
 ):
     """Generate dense vertex and normal map pyramids from raw RGB-D frames."""
     # Build pyramids.
@@ -358,7 +362,7 @@ def surface_measurement(
 
         # # Visualize pointcloud and normals.
         # if level == 0:
-        #     visualize_normal_map(frame.normal_pyramid[level], se3_inverse(pose))
+        #     visualize_normal_map(frame.normal_pyramid[level], se3_inverse(pose_gt))
         #     visualize_pc_o3d(
         #         frame.vertex_pyramid[level].reshape(-1, 3),
         #         frame.color_pyramid[level].reshape(-1, 3).copy() / 255.,
@@ -468,6 +472,8 @@ def surface_reconstruction(
 
 def surface_prediction(
     tsdf_volume: np.ndarray,
+    volume_size: Int3,
+    voxel_scale: float,
     intr: Intrinsic,
     truncation_distance: float,
     current_pose: np.ndarray,
@@ -485,8 +491,31 @@ def surface_prediction(
     References:
         Parker et al, 1998: Interactive Ray Tracing for Isosurface Rendering.
     """
-    # TODO(kevin): Implement.
+    def trilerp():
+        pass
 
+    def get_nearest(origin, direction, volume_range):
+        set_trace()
+
+    def get_furthest(origin, direction, volume_range):
+        pass
+
+    # Compute volume range.
+    volume_range = np.asarray(volume_size) * voxel_scale
+
+    # Compute a direction vector from the camera center through each pixel in world
+    # coordinates.
+    xy = np.indices(intr.resolution, dtype=np.int16).reshape(2, -1)
+    xyz = np.vstack([xy, np.ones((1, xy.shape[-1]))])
+    rays = (xyz.T @ np.linalg.inv(intr.matrix) @ current_pose[:3, :3]).T
+    rays /= np.linalg.norm(rays, axis=0, keepdims=True)
+
+    # Calculate ray length.
+    translation = current_pose[:3, 3]
+    near = get_nearest(translation, rays, volume_range)
+    far = get_furthest(translation, rays, volume_range)
+
+    set_trace()
 
 # ======================================================= #
 # Helper methods.
